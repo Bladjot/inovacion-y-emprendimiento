@@ -9,6 +9,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import tensorflow as tf
+import time
 from collections import deque
 from pathlib import Path
 
@@ -19,6 +20,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = ROOT_DIR / "checkpoints" / "gait_dementia_model.h5"
 SEQUENCE_LENGTH = 100
 THRESHOLD = 0.42  # sensibilidad aumentada
+COUNTDOWN_SECONDS = 10
+ANALYSIS_SECONDS = 10
 
 # ==========================
 # CARGA DEL MODELO
@@ -73,6 +76,10 @@ def normalize_landmark(lm):
 # ==========================
 coords_queue = deque(maxlen=SEQUENCE_LENGTH)
 current_side = None
+countdown_state = "idle"
+countdown_start = None
+analysis_start = None
+simulation_notified = False
 
 # ==========================
 # CAPTURA DE VIDEO
@@ -92,6 +99,12 @@ while True:
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = pose.process(rgb)
+
+    display_label = "⏳ Buscando pose cuerpo completo..."
+    display_color = (0, 165, 255)
+    display_prob = 0.0
+    countdown_overlay = None
+    person_detected = False
 
     if results.pose_landmarks:
         # DIBUJAR LANDMARKS
@@ -157,60 +170,101 @@ while True:
             current_side = None
             cv2.putText(frame, "⚠️ Pierna no detectada con confianza suficiente",
                         (30, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-            cv2.imshow("EarlyGait AI - Detección en vivo", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
 
         # Priorizar pierna derecha; usar izquierda espejada solo si no hay otra opción
-        if right_leg is not None:
-            feature_frame = right_leg
-            selected_side = "right"
-        else:
-            feature_frame = left_leg
-            selected_side = "left"
-
-        if current_side is None:
-            current_side = selected_side
-        elif selected_side != current_side:
-            coords_queue.clear()
-            current_side = selected_side
-
-        coords_queue.append(feature_frame)
-
-        if len(coords_queue) == SEQUENCE_LENGTH:
-            seq = np.array(coords_queue, dtype=np.float32)  # (100, 3, 3)
-            features = np.expand_dims(seq, axis=0)
-
-            # Predicción
-            prob = float(model.predict(features, verbose=0)[0][0])
-            label = "⚠️ Posible alteración de marcha" if prob >= THRESHOLD else "✅ Marcha normal"
-
-            # Color dinámico
-            if prob < 0.45:
-                color = (0, 255, 0)
-            elif prob < 0.6:
-                color = (0, 255, 255)
+        if right_leg is not None or left_leg is not None:
+            if right_leg is not None:
+                feature_frame = right_leg
+                selected_side = "right"
             else:
-                color = (0, 0, 255)
+                feature_frame = left_leg
+                selected_side = "left"
 
-            # Mostrar texto y barra
-            cv2.putText(frame, f"{label} ({prob:.2f})", (30, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+            if current_side is None:
+                current_side = selected_side
+            elif selected_side != current_side:
+                coords_queue.clear()
+                current_side = selected_side
 
-            bar_x, bar_y = 30, 80
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + 300, bar_y + 20), (255, 255, 255), 2)
-            filled = int(prob * 300)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled, bar_y + 20), color, -1)
-
-            # Mostrar en consola
-            print(f"Predicción: {prob:.3f} → {label}")
+            coords_queue.append(feature_frame)
+            person_detected = True
 
     else:
         coords_queue.clear()
         current_side = None
         cv2.putText(frame, "⏳ Buscando pose cuerpo completo...",
                     (30, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+    now = time.time()
+
+    if person_detected:
+        if countdown_state == "idle":
+            countdown_state = "pre"
+            countdown_start = now
+            analysis_start = None
+            simulation_notified = False
+
+        if countdown_state == "pre":
+            elapsed = now - countdown_start if countdown_start else 0.0
+            remaining = max(0.0, COUNTDOWN_SECONDS - elapsed)
+            countdown_overlay = ("Prepárate para caminar", remaining)
+            display_label = "👣 Preparándote para el análisis"
+            display_color = (0, 165, 255)
+            display_prob = 0.0
+            if elapsed >= COUNTDOWN_SECONDS:
+                countdown_state = "analysis"
+                analysis_start = None
+
+        if countdown_state == "analysis":
+            if analysis_start is None:
+                analysis_start = now
+            elapsed = now - analysis_start
+            remaining = max(0.0, ANALYSIS_SECONDS - elapsed)
+            countdown_overlay = ("Analizando marcha", remaining)
+            display_label = "🧠 Analizando marcha (simulación)"
+            display_color = (0, 200, 255)
+            display_prob = 0.0
+            if elapsed >= ANALYSIS_SECONDS:
+                countdown_state = "done"
+
+        if countdown_state == "done":
+            countdown_overlay = None
+            display_label = "✅ Marcha normal (simulación)"
+            display_color = (0, 255, 0)
+            display_prob = 0.2
+            if not simulation_notified:
+                print("Simulación completada: marcha normal")
+                simulation_notified = True
+
+    else:
+        countdown_state = "idle"
+        countdown_start = None
+        analysis_start = None
+        simulation_notified = False
+        countdown_overlay = None
+        display_label = "⏳ Buscando pose cuerpo completo..."
+        display_color = (0, 165, 255)
+        display_prob = 0.0
+
+    cv2.putText(frame, display_label, (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, display_color, 3)
+
+    bar_x, bar_y = 30, 80
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + 300, bar_y + 20), (255, 255, 255), 2)
+    prob_clamped = max(0.0, min(1.0, display_prob))
+    filled = int(prob_clamped * 300)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled, bar_y + 20), display_color, -1)
+
+    if countdown_overlay:
+        overlay_text, seconds_left = countdown_overlay
+        seconds_text = max(0, int(np.ceil(seconds_left)))
+        cv2.putText(frame, overlay_text, (30, 420),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        text_size = cv2.getTextSize(str(seconds_text), cv2.FONT_HERSHEY_SIMPLEX, 3, 6)[0]
+        center_x = (frame.shape[1] - text_size[0]) // 2
+        center_y = (frame.shape[0] // 2) + (text_size[1] // 2)
+        cv2.putText(frame, str(seconds_text), (center_x, center_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 3, (0, 200, 255), 6)
 
     cv2.imshow("EarlyGait AI - Detección en vivo", frame)
 
